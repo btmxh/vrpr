@@ -2,7 +2,7 @@ use smallvec::SmallVec;
 
 use crate::gp::program::{Program, ProgramContext, MAX_PROGRAM_NODE_CHILDREN};
 
-use super::{problem::Request, Simulation, VehicleState};
+use super::{problem::Request, Simulation};
 
 pub struct RoutingContext<'a> {
     pub sim: &'a Simulation<'a>,
@@ -72,15 +72,19 @@ impl<'a> ProgramContext for RoutingContext<'a> {
                     / self.sim.problem.requests.len() as f32
             }
             1 => {
-                self.sim.vehicles[self.vehicle]
-                    .queue
-                    .iter()
-                    .map(|r| r.0.demand)
-                    .sum::<f32>()
+                (self.sim.problem.truck_capacity
+                    - self.sim.vehicles[self.vehicle]
+                        .queue
+                        .iter()
+                        .map(|r| r.0.demand)
+                        .sum::<f32>())
                     / self.sim.problem.total_demand()
             }
             2 => {
-                (self.sim.vehicles[self.vehicle].busy_until - self.sim.time)
+                let (x, y) = self.sim.vehicles[self.vehicle].median_queue_pos();
+                let (rx, ry) = (self.request.x, self.request.y);
+                ((x - rx) * (x - rx) + (y - ry) * (y - ry)).sqrt()
+                    / self.sim.problem.truck_speed
                     / self.sim.problem.depot.close
             }
             3 => {
@@ -90,35 +94,13 @@ impl<'a> ProgramContext for RoutingContext<'a> {
                     self.sim.time,
                 ) / self.sim.problem.depot.close
             }
-            4 => {
-                let pts = self.sim.vehicles[self.vehicle].queue.iter().map(|r| {
-                    self.sim.vehicles[self.vehicle].raw_time_cost(
-                        self.sim.problem,
-                        r.0,
-                        self.sim.time,
-                    ) / self.sim.problem.depot.close
-                });
-                VehicleState::median(pts)
-            }
-            6 => self.request.demand / self.sim.problem.total_demand(),
-            7 | 5 => self.sim.time / self.sim.problem.depot.close,
-            8 => self.request.time / self.sim.problem.depot.close,
-            9 => self.request.service_time / self.sim.problem.depot.close,
-            10 => self.request.open / self.sim.problem.depot.close,
-            11 => self.request.close / self.sim.problem.depot.close,
-            12 => {
-                let (x, y) = self.sim.vehicles[self.vehicle].median_queue_pos();
-                let (rx, ry) = (self.request.x, self.request.y);
-                ((x - rx) * (x - rx) + (y - ry) * (y - ry)).sqrt()
-                    / self.sim.problem.truck_speed
-                    / self.sim.problem.depot.close
-            }
+            4 => self.request.demand / self.sim.problem.total_demand(),
             _ => unreachable!(),
         }
     }
 
     fn num_terminals() -> usize {
-        13
+        5
     }
 }
 
@@ -140,59 +122,25 @@ impl<'a> ProgramContext for SequencingContext<'a> {
     }
 
     fn terminal(&self, idx: usize) -> f32 {
+        let raw_time_cost = self.sim.vehicles[self.vehicle].raw_time_cost(
+            self.sim.problem,
+            self.request,
+            self.sim.time,
+        );
+        let time_until_close = self.request.close - self.sim.vehicles[self.vehicle].busy_until;
+        let wait_time = self.sim.time - self.request.open;
         match idx {
-            0 => {
-                self.sim.vehicles[self.vehicle].queue.len() as f32
-                    / self.sim.problem.requests.len() as f32
-            }
-            1 => {
-                self.sim.vehicles[self.vehicle]
-                    .queue
-                    .iter()
-                    .map(|r| r.0.demand)
-                    .sum::<f32>()
-                    / self.sim.problem.total_demand()
-            }
-            2 => {
-                (self.sim.vehicles[self.vehicle].busy_until - self.sim.time)
-                    / self.sim.problem.depot.close
-            }
-            3 => {
-                self.sim.vehicles[self.vehicle].raw_time_cost(
-                    self.sim.problem,
-                    self.request,
-                    self.sim.time,
-                ) / self.sim.problem.depot.close
-            }
-            4 => {
-                let pts = self.sim.vehicles[self.vehicle].queue.iter().map(|r| {
-                    self.sim.vehicles[self.vehicle].raw_time_cost(
-                        self.sim.problem,
-                        r.0,
-                        self.sim.time,
-                    ) / self.sim.problem.depot.close
-                });
-                VehicleState::median(pts)
-            }
-            5 => self.ready_time / self.sim.problem.depot.close,
-            6 => self.request.demand / self.sim.problem.total_demand(),
-            7 => self.sim.time / self.sim.problem.depot.close,
-            8 => self.request.time / self.sim.problem.depot.close,
-            9 => self.request.service_time / self.sim.problem.depot.close,
-            10 => self.request.open / self.sim.problem.depot.close,
-            11 => self.request.close / self.sim.problem.depot.close,
-            12 => {
-                let (x, y) = self.sim.vehicles[self.vehicle].median_queue_pos();
-                let (rx, ry) = (self.request.x, self.request.y);
-                ((x - rx) * (x - rx) + (y - ry) * (y - ry)).sqrt()
-                    / self.sim.problem.truck_speed
-                    / self.sim.problem.depot.close
-            }
+            0 => raw_time_cost / self.sim.problem.depot.close,
+            1 => (self.sim.time - self.ready_time) / self.sim.problem.depot.close,
+            2 => (time_until_close - raw_time_cost) / time_until_close,
+            3 => self.request.demand / self.sim.problem.total_demand(),
+            4 => wait_time / self.sim.problem.depot.close,
+            5 => self.request.time / self.sim.problem.depot.close,
             _ => unreachable!(),
         }
     }
 
     fn num_terminals() -> usize {
-        return 13;
+        6
     }
 }
