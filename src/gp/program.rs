@@ -1,9 +1,9 @@
+use core::f32;
+use smallvec::SmallVec;
 use std::{
     fmt::{self, Debug, Display, Formatter},
     marker::PhantomData,
 };
-
-use smallvec::SmallVec;
 
 pub const MAX_PROGRAM_NODE_CHILDREN: usize = 2;
 
@@ -161,22 +161,42 @@ impl<C: ProgramContext> Program<C> {
         }
     }
 
-    pub fn calc_at(&self, c: &C, index: usize) -> f32 {
-        match Node::from(self.nodes[index]) {
-            Node::Const(x) => x,
-            Node::Terminal(i) => c.terminal(i),
-            Node::Internal(i) => {
-                let num_children = C::internal_num_children(i);
-                let child_values = Self::child_indices(index, num_children)
-                    .map(|child_index| self.calc_at(c, child_index))
-                    .collect();
-                c.internal(i, child_values)
+    pub fn calc(&self, c: &C) -> f32 {
+        let term_cache = (0..C::num_terminals())
+            .map(|i| c.terminal(i))
+            .collect::<Vec<_>>();
+        let mut dp_vec = Vec::new();
+        dp_vec.resize(self.nodes.len(), f32::NAN);
+
+        let mut stack = Vec::new();
+        stack.push(0usize);
+        while let Some(i) = stack.pop() {
+            match Node::from(self.nodes[i]) {
+                Node::Const(x) => dp_vec[i] = x,
+                Node::Terminal(node_type) => dp_vec[i] = term_cache[node_type],
+                Node::Internal(node_type) => {
+                    let mut done = true;
+                    for child in Self::child_indices(i, C::internal_num_children(node_type))
+                    {
+                        if dp_vec[child].is_nan() {
+                            stack.push(i);
+                            stack.push(child);
+                            done = false;
+                        }
+                    }
+                    if done {
+                        let num_children = C::internal_num_children(node_type);
+                        let child_values = Self::child_indices(i, num_children)
+                            .map(|child_index| dp_vec[child_index])
+                            .collect();
+                        dp_vec[i] = c.internal(node_type, child_values);
+                        _ = stack.pop();
+                    }
+                }
             }
         }
-    }
 
-    pub fn calc(&self, c: &C) -> f32 {
-        self.calc_at(c, 0)
+        dp_vec[0]
     }
 
     pub fn collect_all_active_indices(&self, dest: &mut Vec<usize>, index: usize) {

@@ -69,4 +69,8 @@ impl Problem {
     pub fn clone_training(&self, time_limit: f32) -> Self {
         self.clone().to_training(time_limit)
     }
+
+    pub fn total_demand(&self) -> f32 {
+        self.requests.iter().map(|r| r.demand).sum()
+    }
 }

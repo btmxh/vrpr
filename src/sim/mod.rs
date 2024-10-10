@@ -5,7 +5,7 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use crate::{log, SIM};
+use crate::{log, ROUTE, SIM};
 
 use self::{
     ctx::{RoutingContext, RoutingProgram, SequencingContext, SequencingProgram},
@@ -62,7 +62,8 @@ pub struct VehicleState<'a> {
     total_queued_demand: f32,
     total_demand: f32,
     busy_until: f32,
-    route: Vec<usize>,
+    route: HashMap<usize, f32>,
+    dropped: HashMap<usize, f32>,
 }
 
 impl<'a> VehicleState<'a> {
@@ -73,12 +74,21 @@ impl<'a> VehicleState<'a> {
             total_demand: problem.truck_capacity,
             total_queued_demand: 0.0,
             busy_until: 0.0,
-            route: Vec::new(),
+            route: Default::default(),
+            dropped: Default::default(),
         }
     }
 
     pub fn time_cost(&self, problem: &'a Problem, req: &'a Request, time: f32) -> f32 {
         (self.distance_to(req) / problem.truck_speed).max(req.open - time)
+    }
+
+    pub fn raw_time_cost(&self, problem: &'a Problem, req: &'a Request, _: f32) -> f32 {
+        self.distance_to(req) / problem.truck_speed
+    }
+
+    pub fn time_until_open(&self, req: &'a Request, time: f32) -> f32 {
+        time - req.time
     }
 
     pub fn distance_to(&self, request: &'a Request) -> f32 {
@@ -95,6 +105,26 @@ impl<'a> VehicleState<'a> {
     pub fn enqueue(&mut self, request: &'a Request, time: f32) {
         self.queue.push((request, time));
         self.total_queued_demand += request.demand;
+    }
+
+    pub fn median(x: impl Iterator<Item = f32>) -> f32 {
+        // match x.len() {
+        //     0 => 0.0,
+        //     n => x.iter().copied().sum::<f32>() / n as f32,
+        // }
+        let mut x: Vec<f32> = x.collect();
+        x.sort_unstable_by_key(|f| OrderedFloat::from(*f));
+        match x.len() {
+            0 => 0.0,
+            n if n % 2 == 1 => x[n / 2],
+            n => 0.5 * (x[n / 2] + x[n / 2 - 1]),
+        }
+    }
+
+    pub fn median_queue_pos(&self) -> (f32, f32) {
+        let x = self.queue.iter().map(|r| r.0.x);
+        let y = self.queue.iter().map(|r| r.0.y);
+        (Self::median(x), Self::median(y))
     }
 }
 
@@ -144,7 +174,7 @@ impl<'a> Simulation<'a> {
         let mut total_failed = 0usize;
         while let Some(Reverse(event)) = self.events.pop() {
             self.time = event.time();
-            log!(SIM, "Simulation time: {}", self.time);
+            log!(SIM, "sim_time", time = self.time);
             match event {
                 Event::Requests(requests, _) => {
                     for request in requests {
@@ -164,7 +194,13 @@ impl<'a> Simulation<'a> {
             self.route_vehicle_to(vehicle, &self.problem.depot, &mut total_distance);
         }
         for vehicle in 0..self.problem.num_trucks {
-            log!(SIM, "{}: {:?}", vehicle, self.vehicles[vehicle].route);
+            log!(
+                ROUTE,
+                "route_log",
+                vehicle = vehicle,
+                route = self.vehicles[vehicle].route,
+                dropped = self.vehicles[vehicle].dropped
+            );
         }
 
         (total_distance, total_failed)
@@ -180,20 +216,26 @@ impl<'a> Simulation<'a> {
                         vehicle: *vehicle,
                         request,
                     })),
-                    self.vehicles[*vehicle].queue.len(),
+                    // self.vehicles[*vehicle].queue.len(),
                 )
             })
             .expect("`vehicles` should not be empty");
         self.vehicles[vehicle].enqueue(request, self.time);
         log!(
             SIM,
-            "Assigned request {0} to vehicle {vehicle}",
-            request.idx
+            "vehicle_assigned",
+            vehicle = vehicle,
+            request = request.idx
         );
     }
 
     fn handle_vehicle_finish(&mut self, vehicle: usize, request: &'a Request) {
-        log!(SIM, "Vehicle {vehicle} served request {0}", request.idx);
+        log!(
+            SIM,
+            "vehicle_served",
+            vehicle = vehicle,
+            request = request.idx
+        );
     }
 
     fn update_vehicle_queue(
@@ -215,6 +257,7 @@ impl<'a> Simulation<'a> {
                     sim: self,
                     vehicle,
                     request: self.vehicles[vehicle].queue[*i].0,
+                    ready_time: self.vehicles[vehicle].queue[*i].1,
                 }))
             })
         }) {
@@ -231,13 +274,15 @@ impl<'a> Simulation<'a> {
             let start_time =
                 self.time + self.vehicles[vehicle].time_cost(self.problem, request, self.time);
             if start_time > request.close {
+                self.vehicles[vehicle]
+                    .dropped
+                    .insert(request.idx, start_time);
                 *total_failed += 1;
-                log!(SIM, "Vehicle {vehicle} skipped request {0}", request.idx);
+                log!(SIM, "vehicle_skipped", request = request.idx);
                 continue;
             }
 
             self.route_vehicle_to(vehicle, request, total_distance);
-            return;
         }
     }
 
@@ -257,18 +302,14 @@ impl<'a> Simulation<'a> {
             request,
             time,
         }));
-        state.route.push(request.idx);
+        state.route.insert(request.idx, time - request.service_time);
         state.cur_request = request;
         state.busy_until = time;
         log!(
             SIM,
-            "Vehicle {vehicle} handling request {0}, busy until {1}",
-            request.idx,
-            time
+            "vehicle_new_serve",
+            request = request.idx,
+            busy_until = time
         );
-    }
-
-    pub fn get_route(&self, vehicle: usize) -> &Vec<usize> {
-        &self.vehicles[vehicle].route
     }
 }
