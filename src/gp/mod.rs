@@ -1,6 +1,11 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Range};
 
-use rand::{seq::SliceRandom, Rng, RngCore};
+use rand::{
+    seq::{IteratorRandom, SliceRandom},
+    Rng, RngCore,
+};
+
+use crate::CONST_RATE;
 
 use self::program::{Node, Program, ProgramContext, MAX_PROGRAM_NODE_CHILDREN};
 
@@ -14,8 +19,18 @@ pub struct GPContext<R: RngCore> {
 
 impl<R: RngCore> GPContext<R> {
     pub fn gen_terminal_at<C: ProgramContext>(&self, program: &mut Program<C>, index: usize) {
-        let term_index = self.rng.borrow_mut().gen_range(0..C::num_terminals());
-        program.generate_at(index, 0, Node::Terminal(term_index).into(), |_, _, _| {})
+        let terminal = self.rng.borrow_mut().gen_bool(1.0 - *CONST_RATE);
+        if terminal {
+            let term_index = self.rng.borrow_mut().gen_range(0..C::num_terminals());
+            program.generate_at(index, 0, Node::Terminal(term_index).into(), |_, _, _| {})
+        } else {
+            program.generate_at(
+                index,
+                0,
+                self.rng.borrow_mut().gen_range(0u8 ..= 8) * 16,
+                |_, _, _| {},
+            )
+        }
     }
 
     pub fn gen_internal_at<C: ProgramContext>(
@@ -105,11 +120,13 @@ impl<R: RngCore> GPContext<R> {
             .all_active_indices()
             .choose(&mut *self.rng.borrow_mut())
             .unwrap();
+        p.clear_subtree(swap_pos);
         self.gen_grow_at(
             &mut p,
             swap_pos,
             self.max_depth - Self::depth_from_top(swap_pos),
         );
+        p.verify();
         p
     }
 
@@ -138,34 +155,50 @@ impl<R: RngCore> GPContext<R> {
         )
     }
 
+    fn all_index_of_layer(layer: usize) -> Range<usize> {
+        ((1 << layer) - 1)..(1 << (layer + 1)) - 1
+    }
+
     pub fn crossover<'a, C: ProgramContext>(
         &self,
-        mut p1: &'a Program<C>,
-        mut p2: &'a Program<C>,
-    ) -> Program<C> {
-        if self.rng.borrow_mut().gen_bool(0.5) {
-            std::mem::swap(&mut p1, &mut p2);
-        }
+        p1: &'a Program<C>,
+        p2: &'a Program<C>,
+    ) -> (Program<C>, Program<C>) {
+        let mut c1 = p1.clone();
+        let mut c2 = p2.clone();
+        let depth1 = Self::depth_to_bottom(&c1, 0);
+        let depth2 = Self::depth_to_bottom(&c2, 0);
 
-        let mut c = p1.clone();
-        let swap_pos_1 = *c
-            .all_active_indices()
+        let depth_point1 = self.rng.borrow_mut().gen_range(0..=depth1);
+        let min_depth_point2 = (depth_point1 + depth2).saturating_sub(self.max_depth);
+        let max_depth_point2 = (self.max_depth - depth1 + depth_point1).min(depth2);
+
+        let depth_point2 = self
+            .rng
+            .borrow_mut()
+            .gen_range(min_depth_point2..=max_depth_point2);
+
+        let swap_idx1 = Self::all_index_of_layer(depth_point1)
+            .filter(|i| *i < c1.nodes.len() && !Node::from(c1.nodes[*i]).is_null())
             .choose(&mut *self.rng.borrow_mut())
-            .unwrap();
-        let swap_pos_2 = *p2
-            .all_active_indices()
-            .into_iter()
-            .filter(|index| {
-                let subtree_depth = Self::depth_to_bottom(p2, *index);
-                let limit = self.max_depth - Self::depth_from_top(swap_pos_1);
-                subtree_depth <= limit
-            })
-            .collect::<Vec<_>>()
+            .expect("should not be None");
+        let swap_idx2 = Self::all_index_of_layer(depth_point2)
+            .filter(|i| *i < c2.nodes.len() && !Node::from(c2.nodes[*i]).is_null())
             .choose(&mut *self.rng.borrow_mut())
-            .unwrap();
-        Self::copy_subtree(&mut c, swap_pos_1, p2, swap_pos_2);
-        assert!(Self::depth_to_bottom(&c, 0) <= self.max_depth);
-        c
+            .expect("should not be None");
+
+        c1.clear_subtree(swap_idx1);
+        c2.clear_subtree(swap_idx2);
+
+        Self::copy_subtree(&mut c1, swap_idx1, p2, swap_idx2);
+        Self::copy_subtree(&mut c2, swap_idx2, p1, swap_idx1);
+        assert!(Self::depth_to_bottom(&c1, 0) <= self.max_depth);
+        assert!(Self::depth_to_bottom(&c2, 0) <= self.max_depth);
+
+        c1.verify();
+        c2.verify();
+
+        (c1, c2)
     }
 
     pub fn ramp_half_and_half<C: ProgramContext>(&self) -> Vec<Program<C>> {
@@ -175,9 +208,11 @@ impl<R: RngCore> GPContext<R> {
             for _ in 0..half_size / self.max_depth {
                 let mut p = Program::new();
                 self.gen_full_at(&mut p, 0, depth);
+                p.verify();
                 v.push(p);
                 let mut p = Program::new();
                 self.gen_grow_at(&mut p, 0, depth);
+                p.verify();
                 v.push(p);
             }
         }
@@ -185,9 +220,18 @@ impl<R: RngCore> GPContext<R> {
         while v.len() < self.num_population {
             let mut p = Program::new();
             self.gen_grow_at(&mut p, 0, self.max_depth);
+            p.verify();
             v.push(p);
         }
 
         v
     }
+}
+
+#[test]
+fn tst() {
+    use rand::rngs::ThreadRng;
+    assert_eq!(GPContext::<ThreadRng>::all_index_of_layer(0), 0..1);
+    assert_eq!(GPContext::<ThreadRng>::all_index_of_layer(1), 1..3);
+    assert_eq!(GPContext::<ThreadRng>::all_index_of_layer(2), 3..7);
 }

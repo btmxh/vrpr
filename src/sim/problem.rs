@@ -61,13 +61,35 @@ impl Problem {
         })
     }
 
-    pub fn to_training(mut self, time_limit: f32) -> Self {
-        self.requests.retain(|r| r.time <= time_limit);
-        self
-    }
+    pub fn clone_training(&self, time_limit: f32, stress_factor: f32) -> Self {
+        let mut requests = Vec::new();
+        let mut current_index = 0;
+        let mut turn = 0.0f32;
+        for mut req in self.requests.iter().cloned() {
+            req.x *= stress_factor;
+            req.y *= stress_factor;
+            req.service_time *= stress_factor;
+            if req.time > time_limit {
+                let time_req = self.requests[current_index];
+                req.time = time_limit * turn + (time_req.time + time_req.open * 1.5) / 2.5;
+                req.open = time_limit * turn + time_req.open;
+                req.close = time_limit * turn + time_req.close;
 
-    pub fn clone_training(&self, time_limit: f32) -> Self {
-        self.clone().to_training(time_limit)
+                current_index += 1;
+                if self.requests[current_index].time > time_limit {
+                    current_index = 0;
+                    turn += 1.0;
+                }
+            }
+            requests.push(req);
+        }
+        Self {
+            depot: self.depot,
+            requests,
+            truck_speed: self.truck_speed,
+            num_trucks: self.num_trucks,
+            truck_capacity: self.truck_capacity,
+        }
     }
 
     pub fn total_demand(&self) -> f32 {

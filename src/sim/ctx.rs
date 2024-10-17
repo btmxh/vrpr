@@ -1,18 +1,33 @@
+use std::fmt::{self, Formatter};
+
 use smallvec::SmallVec;
 
 use crate::gp::program::{Program, ProgramContext, MAX_PROGRAM_NODE_CHILDREN};
 
-use super::{problem::Request, Simulation};
+use super::{
+    problem::{Problem, Request},
+    VehicleState,
+};
+
+fn safe_div(x: f32, y: f32) -> f32 {
+    if y.abs() < 1e-4 {
+        1.0
+    } else {
+        x / y
+    }
+}
 
 pub struct RoutingContext<'a> {
-    pub sim: &'a Simulation<'a>,
-    pub vehicle: usize,
+    pub vehicle_state: &'a VehicleState<'a>,
+    pub problem: &'a Problem,
+    pub time: f32,
     pub request: &'a Request,
 }
 
 pub struct SequencingContext<'a> {
-    pub sim: &'a Simulation<'a>,
-    pub vehicle: usize,
+    pub vehicle_state: &'a VehicleState<'a>,
+    pub problem: &'a Problem,
+    pub time: f32,
     pub request: &'a Request,
     pub ready_time: f32,
 }
@@ -23,6 +38,22 @@ fn common_num_internal() -> usize {
 
 fn common_internal_num_children(_: usize) -> usize {
     2
+}
+
+fn common_format_terminal(index: usize, f: &mut Formatter<'_>) -> fmt::Result {
+    write!(
+        f,
+        "{}",
+        match index {
+            0 => "sum",
+            1 => "sub",
+            2 => "mul",
+            3 => "div",
+            4 => "min",
+            5 => "max",
+            _ => unreachable!(),
+        }
+    )
 }
 
 fn common_internal(idx: usize, child_values: SmallVec<[f32; MAX_PROGRAM_NODE_CHILDREN]>) -> f32 {
@@ -65,36 +96,36 @@ impl<'a> ProgramContext for RoutingContext<'a> {
         common_num_internal()
     }
 
+    fn format_internal(index: usize, f: &mut Formatter<'_>) -> fmt::Result {
+        common_format_terminal(index, f)
+    }
+
     fn terminal(&self, idx: usize) -> f32 {
         match idx {
-            0 => {
-                self.sim.vehicles[self.vehicle].queue.len() as f32
-                    / self.sim.problem.requests.len() as f32
-            }
+            0 => self.vehicle_state.queue.len() as f32 / self.problem.requests.len() as f32,
             1 => {
-                (self.sim.problem.truck_capacity
-                    - self.sim.vehicles[self.vehicle]
+                (self.problem.truck_capacity
+                    - self
+                        .vehicle_state
                         .queue
                         .iter()
                         .map(|r| r.0.demand)
                         .sum::<f32>())
-                    / self.sim.problem.total_demand()
+                    / self.problem.total_demand()
             }
             2 => {
-                let (x, y) = self.sim.vehicles[self.vehicle].median_queue_pos();
+                let (x, y) = self.vehicle_state.median_queue_pos();
                 let (rx, ry) = (self.request.x, self.request.y);
                 ((x - rx) * (x - rx) + (y - ry) * (y - ry)).sqrt()
-                    / self.sim.problem.truck_speed
-                    / self.sim.problem.depot.close
+                    / self.problem.truck_speed
+                    / self.problem.depot.close
             }
             3 => {
-                self.sim.vehicles[self.vehicle].raw_time_cost(
-                    self.sim.problem,
-                    self.request,
-                    self.sim.time,
-                ) / self.sim.problem.depot.close
+                self.vehicle_state
+                    .raw_time_cost(self.problem, self.request, self.time)
+                    / self.problem.depot.close
             }
-            4 => self.request.demand / self.sim.problem.total_demand(),
+            4 => self.request.demand / self.problem.total_demand(),
             _ => unreachable!(),
         }
     }
@@ -121,21 +152,23 @@ impl<'a> ProgramContext for SequencingContext<'a> {
         common_num_internal()
     }
 
+    fn format_internal(index: usize, f: &mut Formatter<'_>) -> fmt::Result {
+        common_format_terminal(index, f)
+    }
+
     fn terminal(&self, idx: usize) -> f32 {
-        let raw_time_cost = self.sim.vehicles[self.vehicle].raw_time_cost(
-            self.sim.problem,
-            self.request,
-            self.sim.time,
-        );
-        let time_until_close = self.request.close - self.sim.vehicles[self.vehicle].busy_until;
-        let wait_time = self.sim.time - self.request.open;
+        let raw_time_cost = self
+            .vehicle_state
+            .raw_time_cost(self.problem, self.request, self.time);
+        let time_until_close = self.request.close - self.vehicle_state.busy_until;
+        let wait_time = self.time - self.request.open;
         match idx {
-            0 => raw_time_cost / self.sim.problem.depot.close,
-            1 => (self.sim.time - self.ready_time) / self.sim.problem.depot.close,
-            2 => (time_until_close - raw_time_cost) / time_until_close,
-            3 => self.request.demand / self.sim.problem.total_demand(),
-            4 => wait_time / self.sim.problem.depot.close,
-            5 => self.request.time / self.sim.problem.depot.close,
+            0 => raw_time_cost / self.problem.depot.close,
+            1 => (self.time - self.ready_time) / self.problem.depot.close,
+            2 => safe_div(time_until_close - raw_time_cost, time_until_close),
+            3 => self.request.demand / self.problem.total_demand(),
+            4 => wait_time / self.problem.depot.close,
+            5 => self.request.time / self.problem.depot.close,
             _ => unreachable!(),
         }
     }

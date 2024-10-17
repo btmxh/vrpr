@@ -1,11 +1,11 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap},
 };
 
 use ordered_float::OrderedFloat;
 
-use crate::{log, ROUTE, SIM};
+use crate::{log, ROUTE, ROUTEEVAL, SIM};
 
 use self::{
     ctx::{RoutingContext, RoutingProgram, SequencingContext, SequencingProgram},
@@ -59,11 +59,11 @@ impl Ord for Event<'_> {
 pub struct VehicleState<'a> {
     cur_request: &'a Request,
     queue: Vec<(&'a Request, f32)>,
-    total_queued_demand: f32,
+    // total_queued_demand: f32,
     total_demand: f32,
     busy_until: f32,
-    route: HashMap<usize, f32>,
-    dropped: HashMap<usize, f32>,
+    pub route: BTreeMap<i32, usize>,
+    pub dropped: BTreeMap<i32, usize>,
 }
 
 impl<'a> VehicleState<'a> {
@@ -72,7 +72,7 @@ impl<'a> VehicleState<'a> {
             cur_request: &problem.depot,
             queue: Vec::new(),
             total_demand: problem.truck_capacity,
-            total_queued_demand: 0.0,
+            // total_queued_demand: 0.0,
             busy_until: 0.0,
             route: Default::default(),
             dropped: Default::default(),
@@ -104,7 +104,7 @@ impl<'a> VehicleState<'a> {
 
     pub fn enqueue(&mut self, request: &'a Request, time: f32) {
         self.queue.push((request, time));
-        self.total_queued_demand += request.demand;
+        // self.total_queued_demand += request.demand;
     }
 
     pub fn median(x: impl Iterator<Item = f32>) -> f32 {
@@ -128,12 +128,92 @@ impl<'a> VehicleState<'a> {
     }
 }
 
+trait RoutingRule {
+    fn route_request(
+        &self,
+        problem: &Problem,
+        time: f32,
+        vehicles: &[VehicleState],
+        request: &Request,
+    ) -> Option<usize>;
+}
+
+trait SequencingRule {
+    fn sequence_request(
+        &self,
+        problem: &Problem,
+        time: f32,
+        vehicle: &VehicleState,
+        cache: &mut HashMap<usize, OrderedFloat<f32>>,
+    ) -> Option<usize>;
+}
+
+impl<'a> RoutingRule for RoutingProgram<'a> {
+    fn route_request(
+        &self,
+        problem: &Problem,
+        time: f32,
+        vehicles: &[VehicleState],
+        request: &Request,
+    ) -> Option<usize> {
+        (0..vehicles.len())
+            .filter(|vehicle| {
+                let cost = vehicles[*vehicle].raw_time_cost(problem, request, time);
+                time + cost <= request.close
+            })
+            .min_by_key(|vehicle| {
+                let value = self.calc(&RoutingContext {
+                    problem,
+                    time,
+                    vehicle_state: &vehicles[*vehicle],
+                    request,
+                });
+                assert!(value.is_finite());
+                log!(
+                    ROUTEEVAL,
+                    "routing_evaluation",
+                    value = value,
+                    vehicle = vehicle
+                );
+                (
+                    OrderedFloat(value),
+                    // vehicles[*vehicle].queue.len(),
+                )
+            })
+    }
+}
+
+impl<'a> SequencingRule for SequencingProgram<'a> {
+    fn sequence_request(
+        &self,
+        problem: &Problem,
+        time: f32,
+        vehicle_state: &VehicleState,
+        cache: &mut HashMap<usize, OrderedFloat<f32>>,
+    ) -> Option<usize> {
+        (0..vehicle_state.queue.len()).min_by_key(|i| {
+            let request_idx = vehicle_state.queue[*i].0.idx;
+            *cache.entry(request_idx).or_insert_with(|| {
+                let value = self.calc(&SequencingContext {
+                    problem,
+                    time,
+                    vehicle_state,
+                    request: vehicle_state.queue[*i].0,
+                    ready_time: vehicle_state.queue[*i].1,
+                });
+                assert!(value.is_finite());
+                OrderedFloat(value)
+            })
+        })
+    }
+}
+
 pub struct Simulation<'a> {
     problem: &'a Problem,
     routing_rule: &'a RoutingProgram<'a>,
     sequencing_rule: &'a SequencingProgram<'a>,
     time: f32,
-    vehicles: Vec<VehicleState<'a>>,
+    pub vehicles: Vec<VehicleState<'a>>,
     events: BinaryHeap<Reverse<Event<'a>>>,
 }
 
@@ -155,7 +235,7 @@ impl<'a> Simulation<'a> {
         }
     }
 
-    pub fn simulate(&mut self, time_slot: f32) -> (f32, usize) {
+    pub fn simulate_until(&mut self, time_slot: f32, time_max: f32) -> (f32, usize) {
         let mut batched_requests = HashMap::<i32, Vec<&'a Request>>::new();
         for request in self.problem.requests.iter() {
             let timeslot_idx = (request.time / time_slot).ceil() as i32;
@@ -173,12 +253,17 @@ impl<'a> Simulation<'a> {
         let mut total_distance = 0f32;
         let mut total_failed = 0usize;
         while let Some(Reverse(event)) = self.events.pop() {
+            if event.time() > time_max {
+                self.events.push(Reverse(event));
+                break;
+            }
+
             self.time = event.time();
             log!(SIM, "sim_time", time = self.time);
             match event {
                 Event::Requests(requests, _) => {
                     for request in requests {
-                        self.handle_request(request)
+                        self.handle_request(request, &mut total_failed);
                     }
                 }
                 Event::VehicleFinish {
@@ -206,27 +291,25 @@ impl<'a> Simulation<'a> {
         (total_distance, total_failed)
     }
 
-    fn handle_request(&mut self, request: &'a Request) {
-        let vehicles = 0..self.vehicles.len();
-        let vehicle = vehicles
-            .min_by_key(|vehicle| {
-                (
-                    OrderedFloat(self.routing_rule.calc(&RoutingContext {
-                        sim: self,
-                        vehicle: *vehicle,
-                        request,
-                    })),
-                    // self.vehicles[*vehicle].queue.len(),
-                )
-            })
-            .expect("`vehicles` should not be empty");
-        self.vehicles[vehicle].enqueue(request, self.time);
-        log!(
-            SIM,
-            "vehicle_assigned",
-            vehicle = vehicle,
-            request = request.idx
-        );
+    fn handle_request(&mut self, request: &'a Request, total_failed: &mut usize) {
+        if let Some(vehicle) =
+            self.routing_rule
+                .route_request(self.problem, self.time, &self.vehicles, request)
+        {
+            self.vehicles[vehicle].enqueue(request, self.time);
+            log!(
+                SIM,
+                "vehicle_assigned",
+                vehicle = vehicle,
+                request = request.idx
+            );
+        } else {
+            // self.vehicles[vehicle]
+            //     .dropped
+            //     .insert(start_time as _, request.idx);
+            *total_failed += 1;
+            log!(SIM, "vehicle_skipped", request = request.idx);
+        }
     }
 
     fn handle_vehicle_finish(&mut self, vehicle: usize, request: &'a Request) {
@@ -250,17 +333,12 @@ impl<'a> Simulation<'a> {
 
         let mut cache = HashMap::<usize, OrderedFloat<f32>>::new();
 
-        while let Some(index) = (0..self.vehicles[vehicle].queue.len()).min_by_key(|i| {
-            let request_idx = self.vehicles[vehicle].queue[*i].0.idx;
-            *cache.entry(request_idx).or_insert_with(|| {
-                OrderedFloat(self.sequencing_rule.calc(&SequencingContext {
-                    sim: self,
-                    vehicle,
-                    request: self.vehicles[vehicle].queue[*i].0,
-                    ready_time: self.vehicles[vehicle].queue[*i].1,
-                }))
-            })
-        }) {
+        while let Some(index) = self.sequencing_rule.sequence_request(
+            self.problem,
+            self.time,
+            &self.vehicles[vehicle],
+            &mut cache,
+        ) {
             let queue = &mut self.vehicles[vehicle].queue;
             let request = queue[index].0;
             if request.demand > self.vehicles[vehicle].total_demand {
@@ -270,15 +348,10 @@ impl<'a> Simulation<'a> {
             }
 
             self.vehicles[vehicle].queue.swap_remove(index);
-            self.vehicles[vehicle].total_queued_demand -= request.demand;
             let start_time =
                 self.time + self.vehicles[vehicle].time_cost(self.problem, request, self.time);
             if start_time > request.close {
-                self.vehicles[vehicle]
-                    .dropped
-                    .insert(request.idx, start_time);
-                *total_failed += 1;
-                log!(SIM, "vehicle_skipped", request = request.idx);
+                self.handle_request(request, total_failed);
                 continue;
             }
 
@@ -302,7 +375,9 @@ impl<'a> Simulation<'a> {
             request,
             time,
         }));
-        state.route.insert(request.idx, time - request.service_time);
+        state
+            .route
+            .insert((time - request.service_time) as _, request.idx);
         state.cur_request = request;
         state.busy_until = time;
         log!(
