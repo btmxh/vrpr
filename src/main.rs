@@ -285,23 +285,5 @@ fn main() -> anyhow::Result<()> {
         log!(MAIN, "gp_start");
         gp(&problem)?;
     }
-
-    // let routing: Vec<u8> = vec![Node::Internal(5).into(), Node::Terminal(3).into(), Node::Terminal(4).into()];
-    // let sequencing: Vec<u8> = vec![195, 194, 197, 196, 196, 130, 129, 129, 129, 129, 134];
-    let result = Simulation::new(
-        &problem,
-        &RoutingProgram::from_base64("xgDCAMMAxQCCAIQBxQDGAP8FhADEAIMAhQD/DcEAhQD/H4QAggD/KQ=="),
-        &SequencingProgram::from_base64(
-            "xADDAIYAxQDCAP8BxgDEAIMAggD/A8EAgQDGAIYA/wuDAMYA/wGBAIQA/xuBAIQA/zc=",
-        ),
-    )
-    .simulate_until(problem.depot.close / *NUM_TIME_SLOT, f32::MAX);
-    log!(DEBUG, "sludge", result = result);
-    // println!(
-    //     "{}\n{}",
-    //     RoutingProgram::terminal(5),
-    //     SequencingProgram::from_vec(sequencing)
-    // );
-
     Ok(())
 }
