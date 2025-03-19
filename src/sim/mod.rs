@@ -356,6 +356,7 @@ impl<'a> Simulation<'a> {
             }
 
             self.route_vehicle_to(vehicle, request, total_distance);
+            return;
         }
     }
 
