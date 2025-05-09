@@ -69,13 +69,13 @@ lazy_static! {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
+    static ref EVAL: Option<String> = env::var("EVAL").ok();
 }
 
 fn fitness(problem: &Problem, result: (f32, usize)) -> f32 {
-    let (distance, num_fail) = result;
-    let tot_dist = problem.truck_speed * problem.depot.close * problem.num_trucks as f32;
+    let (makespan, num_fail) = result;
     let weight = *WEIGHT;
-    distance / tot_dist * weight
+    makespan / problem.depot.close * weight
         + (num_fail as f32) / (problem.requests.len() as f32) * (1.0 - weight)
 }
 
@@ -89,7 +89,7 @@ fn heuristics(problem: &Problem) -> anyhow::Result<()> {
     ]);
     let W = SequencingProgram::terminal(3);
     let WIQ = RoutingProgram::terminal(1);
-    for (name, r, s) in [("C+C", &CR, &CS), ("C+W", &CR, &W), ("WIQ+C", &WIQ, &CS)] {
+    for (name, r, s) in [("C+C", &CR, &CS)] {
         let mut simulation = Simulation::new(problem, r, s);
         let result = simulation.simulate_until(problem.depot.close / *NUM_TIME_SLOT, f32::MAX);
         log!(
@@ -226,7 +226,7 @@ fn gp(problem: &Problem) -> anyhow::Result<()> {
         );
 
         if gen == *NUM_GEN {
-            for vehicle in 0..problem.num_trucks {
+            for vehicle in 0..sim.vehicles.len() {
                 log!(
                     LASTROUTE,
                     "route_log",
@@ -276,7 +276,7 @@ fn main() -> anyhow::Result<()> {
     _ = dotenv::dotenv()?;
     log!(MAIN, "start");
     let path = args().nth(1).expect("usage: cargo run -- [problem path]");
-    let problem = Problem::load(&path, 1.0, 1300.0, 10)?;
+    let problem = Problem::load_pj2(&path)?;
     if HEU.enabled() {
         log!(MAIN, "heu_start");
         heuristics(&problem)?;
@@ -284,6 +284,16 @@ fn main() -> anyhow::Result<()> {
     if GP.enabled() {
         log!(MAIN, "gp_start");
         gp(&problem)?;
+    }
+    if let Some(ref eval_str) = *EVAL {
+        let pair = eval_str.split_once(' ');
+        if let Some((rr, sr)) = pair {
+            let routing_rule = RoutingProgram::from_base64(rr);
+            let sequencing_rule = SequencingProgram::from_base64(sr);
+            let mut simulation = Simulation::new(&problem, &routing_rule, &sequencing_rule);
+            let result = simulation.simulate_until(problem.depot.close / *NUM_TIME_SLOT, f32::MAX);
+            log!(MAIN, "eval_result", result = result);
+        }
     }
     Ok(())
 }

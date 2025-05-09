@@ -1,11 +1,13 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    time::Duration,
 };
 
-use ordered_float::OrderedFloat;
+use ordered_float::{Float, OrderedFloat};
+use problem::VehicleFamily;
 
-use crate::{log, ROUTE, ROUTEEVAL, SIM};
+use crate::{log, DEBUG, ROUTE, ROUTEEVAL, SIM};
 
 use self::{
     ctx::{RoutingContext, RoutingProgram, SequencingContext, SequencingProgram},
@@ -22,6 +24,12 @@ pub enum Event<'a> {
         request: &'a Request,
         time: f32,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VehicleIndex {
+    pub family_idx: usize,
+    pub vehicle_idx: usize,
 }
 
 impl Event<'_> {
@@ -57,34 +65,40 @@ impl Ord for Event<'_> {
 }
 
 pub struct VehicleState<'a> {
+    family: &'a VehicleFamily,
     cur_request: &'a Request,
     queue: Vec<(&'a Request, f32)>,
     // total_queued_demand: f32,
     total_demand: f32,
+    total_charge: f32,
     busy_until: f32,
     pub route: BTreeMap<i32, usize>,
     pub dropped: BTreeMap<i32, usize>,
+    pub total_distance: f32,
 }
 
 impl<'a> VehicleState<'a> {
-    pub fn new(problem: &'a Problem) -> Self {
+    pub fn new(problem: &'a Problem, family: &'a VehicleFamily) -> Self {
         Self {
+            family,
             cur_request: &problem.depot,
             queue: Vec::new(),
-            total_demand: problem.truck_capacity,
+            total_demand: family.capacity,
+            total_charge: family.charge_limit,
             // total_queued_demand: 0.0,
             busy_until: 0.0,
             route: Default::default(),
             dropped: Default::default(),
+            total_distance: 0.0,
         }
     }
 
     pub fn time_cost(&self, problem: &'a Problem, req: &'a Request, time: f32) -> f32 {
-        (self.distance_to(req) / problem.truck_speed).max(req.open - time)
+        (self.distance_to(req) / self.family.speed).max(req.open - time)
     }
 
     pub fn raw_time_cost(&self, problem: &'a Problem, req: &'a Request, _: f32) -> f32 {
-        self.distance_to(req) / problem.truck_speed
+        self.distance_to(req) / self.family.speed
     }
 
     pub fn time_until_open(&self, req: &'a Request, time: f32) -> f32 {
@@ -135,7 +149,7 @@ trait RoutingRule {
         time: f32,
         vehicles: &[VehicleState],
         request: &Request,
-    ) -> Option<usize>;
+    ) -> Vec<usize>;
 }
 
 trait SequencingRule {
@@ -148,6 +162,26 @@ trait SequencingRule {
     ) -> Option<usize>;
 }
 
+fn k_smallest_by_key<T, K, F>(iter: impl IntoIterator<Item = T>, k: usize, key_fn: F) -> Vec<T>
+where
+    F: Fn(&T) -> K,
+    K: Ord,
+    T: Clone + Ord,
+{
+    let mut heap = BinaryHeap::with_capacity(k + 1);
+
+    for item in iter {
+        let key = key_fn(&item);
+        heap.push((Reverse(key), item));
+
+        if heap.len() > k {
+            heap.pop();
+        }
+    }
+
+    heap.into_iter().map(|(_, item)| item).collect()
+}
+
 impl<'a> RoutingRule for RoutingProgram<'a> {
     fn route_request(
         &self,
@@ -155,31 +189,36 @@ impl<'a> RoutingRule for RoutingProgram<'a> {
         time: f32,
         vehicles: &[VehicleState],
         request: &Request,
-    ) -> Option<usize> {
-        (0..vehicles.len())
+    ) -> Vec<usize> {
+        let suitable_vehicles = (0..vehicles.len())
             .filter(|vehicle| {
+                let cost_to_depot =
+                    Simulation::time_dist(&problem.depot, request, vehicles[*vehicle].family.speed);
                 let cost = vehicles[*vehicle].raw_time_cost(problem, request, time);
                 time + cost <= request.close
+                    && cost_to_depot * 2.0 <= vehicles[*vehicle].family.charge_limit
             })
-            .min_by_key(|vehicle| {
-                let value = self.calc(&RoutingContext {
-                    problem,
-                    time,
-                    vehicle_state: &vehicles[*vehicle],
-                    request,
-                });
-                assert!(value.is_finite());
-                log!(
-                    ROUTEEVAL,
-                    "routing_evaluation",
-                    value = value,
-                    vehicle = vehicle
-                );
-                (
-                    OrderedFloat(value),
-                    // vehicles[*vehicle].queue.len(),
-                )
-            })
+            .filter(|vehicle| vehicles[*vehicle].family.capacity >= request.demand)
+            .filter(|vehicle| !vehicles[*vehicle].family.drone || request.drone_serve);
+        return k_smallest_by_key(suitable_vehicles, 5, |vehicle| {
+            let value = self.calc(&RoutingContext {
+                problem,
+                time,
+                vehicle_state: &vehicles[*vehicle],
+                request,
+            });
+            assert!(value.is_finite());
+            log!(
+                ROUTEEVAL,
+                "routing_evaluation",
+                value = value,
+                vehicle = vehicle
+            );
+            (
+                OrderedFloat(value),
+                // vehicles[*vehicle].queue.len(),
+            )
+        });
     }
 }
 
@@ -215,6 +254,7 @@ pub struct Simulation<'a> {
     time: f32,
     pub vehicles: Vec<VehicleState<'a>>,
     events: BinaryHeap<Reverse<Event<'a>>>,
+    resolved: HashSet<usize>,
 }
 
 impl<'a> Simulation<'a> {
@@ -223,15 +263,19 @@ impl<'a> Simulation<'a> {
         routing_rule: &'a RoutingProgram<'a>,
         sequencing_rule: &'a SequencingProgram<'a>,
     ) -> Self {
+        let vehicles = problem
+            .vehicles
+            .iter()
+            .flat_map(|fam| (0..fam.count).map(|_| VehicleState::new(problem, fam)))
+            .collect();
         Self {
             problem,
             routing_rule,
             sequencing_rule,
             time: 0.0,
-            vehicles: (0..problem.num_trucks)
-                .map(|_| VehicleState::new(problem))
-                .collect(),
+            vehicles,
             events: BinaryHeap::new(),
+            resolved: HashSet::new(),
         }
     }
 
@@ -250,7 +294,6 @@ impl<'a> Simulation<'a> {
                 .push(Reverse(Event::Requests(requests, idx as f32 * time_slot)));
         }
 
-        let mut total_distance = 0f32;
         let mut total_failed = 0usize;
         while let Some(Reverse(event)) = self.events.pop() {
             if event.time() > time_max {
@@ -270,15 +313,15 @@ impl<'a> Simulation<'a> {
                     vehicle, request, ..
                 } => self.handle_vehicle_finish(vehicle, request),
             }
-            for vehicle in 0..self.problem.num_trucks {
-                self.update_vehicle_queue(vehicle, &mut total_failed, &mut total_distance);
+            for vehicle in 0..self.vehicles.len() {
+                self.update_vehicle_queue(vehicle, &mut total_failed);
             }
         }
 
-        for vehicle in 0..self.problem.num_trucks {
-            self.route_vehicle_to(vehicle, &self.problem.depot, &mut total_distance);
+        for vehicle in 0..self.vehicles.len() {
+            self.route_vehicle_to(vehicle, &self.problem.depot);
         }
-        for vehicle in 0..self.problem.num_trucks {
+        for vehicle in 0..self.vehicles.len() {
             log!(
                 ROUTE,
                 "route_log",
@@ -288,31 +331,44 @@ impl<'a> Simulation<'a> {
             );
         }
 
-        (total_distance, total_failed)
+        let makespan = self
+            .vehicles
+            .iter()
+            .map(|v| v.total_distance / v.family.speed)
+            .max_by_key(|f| OrderedFloat(*f))
+            .expect("should not be empty");
+        (makespan, total_failed)
     }
 
     fn handle_request(&mut self, request: &'a Request, total_failed: &mut usize) {
-        if let Some(vehicle) =
+        if self.resolved.contains(&request.idx) {
+            return;
+        }
+
+        let vehicles =
             self.routing_rule
-                .route_request(self.problem, self.time, &self.vehicles, request)
-        {
-            self.vehicles[vehicle].enqueue(request, self.time);
-            log!(
-                SIM,
-                "vehicle_assigned",
-                vehicle = vehicle,
-                request = request.idx
-            );
-        } else {
-            // self.vehicles[vehicle]
-            //     .dropped
-            //     .insert(start_time as _, request.idx);
+                .route_request(self.problem, self.time, &self.vehicles, request);
+
+        if vehicles.is_empty() {
+            self.resolved.insert(request.idx);
             *total_failed += 1;
             log!(SIM, "vehicle_skipped", request = request.idx);
+            return;
+        }
+
+        log!(
+            SIM,
+            "vehicle_assigned",
+            request = request.idx,
+            vehicles = vehicles
+        );
+        for vehicle in vehicles {
+            self.vehicles[vehicle].enqueue(request, self.time);
         }
     }
 
     fn handle_vehicle_finish(&mut self, vehicle: usize, request: &'a Request) {
+        self.resolved.insert(request.idx);
         log!(
             SIM,
             "vehicle_served",
@@ -321,12 +377,14 @@ impl<'a> Simulation<'a> {
         );
     }
 
-    fn update_vehicle_queue(
-        &mut self,
-        vehicle: usize,
-        total_failed: &mut usize,
-        total_distance: &mut f32,
-    ) {
+    fn time_dist(r1: &Request, r2: &Request, speed: f32) -> f32 {
+        let dx = r1.x - r2.x;
+        let dy = r1.y - r2.y;
+        let dist = (dx * dx + dy * dy).sqrt();
+        dist / speed
+    }
+
+    fn update_vehicle_queue(&mut self, vehicle: usize, total_failed: &mut usize) {
         if self.time < self.vehicles[vehicle].busy_until {
             return;
         }
@@ -339,11 +397,29 @@ impl<'a> Simulation<'a> {
             &self.vehicles[vehicle],
             &mut cache,
         ) {
+            if self.resolved.contains(&index) {
+                self.vehicles[vehicle].queue.swap_remove(index);
+                continue;
+            }
+
             let queue = &mut self.vehicles[vehicle].queue;
             let request = queue[index].0;
+
+            assert!(request.demand <= self.vehicles[vehicle].family.capacity);
+
             if request.demand > self.vehicles[vehicle].total_demand {
                 // return to depot
-                self.route_vehicle_to(vehicle, &self.problem.depot, total_distance);
+                self.route_vehicle_to(vehicle, &self.problem.depot);
+                return;
+            }
+
+            let speed = self.vehicles[vehicle].family.speed;
+            if self.vehicles[vehicle].total_charge
+                < Self::time_dist(self.vehicles[vehicle].cur_request, request, speed)
+                    + Self::time_dist(request, &self.problem.depot, speed)
+            {
+                // return to depot
+                self.route_vehicle_to(vehicle, &self.problem.depot);
                 return;
             }
 
@@ -355,21 +431,23 @@ impl<'a> Simulation<'a> {
                 continue;
             }
 
-            self.route_vehicle_to(vehicle, request, total_distance);
+            self.route_vehicle_to(vehicle, request);
             return;
         }
     }
 
-    fn route_vehicle_to(&mut self, vehicle: usize, request: &'a Request, total_distance: &mut f32) {
+    fn route_vehicle_to(&mut self, vehicle: usize, request: &'a Request) {
         let state = &mut self.vehicles[vehicle];
         let distance = state.distance_to(request);
-        *total_distance += distance;
-        let time = (self.time + distance / self.problem.truck_speed).max(request.open)
-            + request.service_time;
+        let family = state.family;
+        state.total_distance += distance;
+        let time = (self.time + distance / family.speed).max(request.open) + request.service_time;
         if request.idx == 0 {
-            state.total_demand = self.problem.truck_capacity;
+            state.total_demand = family.capacity;
+            state.total_charge = family.charge_limit;
         } else {
             state.total_demand -= request.demand;
+            state.total_charge -= distance;
         }
         self.events.push(Reverse(Event::VehicleFinish {
             vehicle,

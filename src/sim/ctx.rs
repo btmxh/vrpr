@@ -104,7 +104,7 @@ impl<'a> ProgramContext for RoutingContext<'a> {
         match idx {
             0 => self.vehicle_state.queue.len() as f32 / self.problem.requests.len() as f32,
             1 => {
-                (self.problem.truck_capacity
+                (self.vehicle_state.family.capacity
                     - self
                         .vehicle_state
                         .queue
@@ -117,7 +117,7 @@ impl<'a> ProgramContext for RoutingContext<'a> {
                 let (x, y) = self.vehicle_state.median_queue_pos();
                 let (rx, ry) = (self.request.x, self.request.y);
                 ((x - rx) * (x - rx) + (y - ry) * (y - ry)).sqrt()
-                    / self.problem.truck_speed
+                    / self.vehicle_state.family.speed
                     / self.problem.depot.close
             }
             3 => {
