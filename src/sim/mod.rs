@@ -73,7 +73,7 @@ pub struct VehicleState<'a> {
     total_charge: f32,
     busy_until: f32,
     pub route: BTreeMap<i32, usize>,
-    pub dropped: BTreeMap<i32, usize>,
+    pub dropped: HashSet<usize>,
     pub total_distance: f32,
 }
 
@@ -194,13 +194,16 @@ impl<'a> RoutingRule for RoutingProgram<'a> {
             .filter(|vehicle| {
                 let cost_to_depot =
                     Simulation::time_dist(&problem.depot, request, vehicles[*vehicle].family.speed);
+                cost_to_depot * 2.0 <= vehicles[*vehicle].family.charge_limit
+            })
+            .filter(|vehicle| {
                 let cost = vehicles[*vehicle].raw_time_cost(problem, request, time);
                 time + cost <= request.close
-                    && cost_to_depot * 2.0 <= vehicles[*vehicle].family.charge_limit
             })
+            .filter(|vehicle| !vehicles[*vehicle].dropped.contains(&request.idx))
             .filter(|vehicle| vehicles[*vehicle].family.capacity >= request.demand)
             .filter(|vehicle| !vehicles[*vehicle].family.drone || request.drone_serve);
-        return k_smallest_by_key(suitable_vehicles, 5, |vehicle| {
+        k_smallest_by_key(suitable_vehicles, 5, |vehicle| {
             let value = self.calc(&RoutingContext {
                 problem,
                 time,
@@ -218,7 +221,7 @@ impl<'a> RoutingRule for RoutingProgram<'a> {
                 OrderedFloat(value),
                 // vehicles[*vehicle].queue.len(),
             )
-        });
+        })
     }
 }
 
@@ -263,11 +266,12 @@ impl<'a> Simulation<'a> {
         routing_rule: &'a RoutingProgram<'a>,
         sequencing_rule: &'a SequencingProgram<'a>,
     ) -> Self {
-        let vehicles = problem
+        let vehicles: Vec<_> = problem
             .vehicles
             .iter()
             .flat_map(|fam| (0..fam.count).map(|_| VehicleState::new(problem, fam)))
             .collect();
+        log!(DEBUG, "wtf", len = vehicles.len());
         Self {
             problem,
             routing_rule,
@@ -287,6 +291,12 @@ impl<'a> Simulation<'a> {
                 .entry(timeslot_idx)
                 .or_default()
                 .push(request);
+            log!(
+                DEBUG,
+                "timeslot",
+                time_slot = time_slot,
+                timeslot_idx = timeslot_idx
+            );
         }
 
         for (idx, requests) in batched_requests {
@@ -368,7 +378,6 @@ impl<'a> Simulation<'a> {
     }
 
     fn handle_vehicle_finish(&mut self, vehicle: usize, request: &'a Request) {
-        self.resolved.insert(request.idx);
         log!(
             SIM,
             "vehicle_served",
@@ -397,7 +406,10 @@ impl<'a> Simulation<'a> {
             &self.vehicles[vehicle],
             &mut cache,
         ) {
-            if self.resolved.contains(&index) {
+            if self
+                .resolved
+                .contains(&self.vehicles[vehicle].queue[index].0.idx)
+            {
                 self.vehicles[vehicle].queue.swap_remove(index);
                 continue;
             }
@@ -427,6 +439,7 @@ impl<'a> Simulation<'a> {
             let start_time =
                 self.time + self.vehicles[vehicle].time_cost(self.problem, request, self.time);
             if start_time > request.close {
+                self.vehicles[vehicle].dropped.insert(request.idx);
                 self.handle_request(request, total_failed);
                 continue;
             }
@@ -459,6 +472,7 @@ impl<'a> Simulation<'a> {
             .insert((time - request.service_time) as _, request.idx);
         state.cur_request = request;
         state.busy_until = time;
+        assert!(self.resolved.insert(request.idx) || request.idx == 0);
         log!(
             SIM,
             "vehicle_new_serve",

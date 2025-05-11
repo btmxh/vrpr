@@ -1,7 +1,7 @@
 use std::{env::var, fmt::Display, fs::File, io::Write, sync::Mutex};
 
 use chrono::Local;
-use miniserde::{json, Serialize};
+use serde::Serialize;
 
 #[macro_export]
 macro_rules! log {
@@ -100,9 +100,9 @@ impl Logger {
         if comma {
             self.write(',');
         }
-        self.write(json::to_string(key));
+        self.write(serde_json::to_string(key).unwrap());
         self.write(':');
-        self.write(json::to_string(value));
+        self.write(serde_json::to_string(value).unwrap());
     }
 
     pub fn log(&self, value: impl Display) {
