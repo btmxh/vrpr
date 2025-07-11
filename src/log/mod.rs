@@ -84,7 +84,7 @@ impl Logger {
     pub fn begin(&self) {
         self.write('{');
         self.log_key_value("__", &self.name, false);
-        self.log_key_value("_t", &now(), true);
+        // self.log_key_value("_t", &now(), true);
     }
 
     pub fn end(&self) {

@@ -33,6 +33,7 @@ lazy_static! {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.1);
+    static ref K: usize = env::var("K").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     static ref WEIGHT: f32 = env::var("WEIGHT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -87,9 +88,13 @@ fn heuristics(problem: &Problem) -> anyhow::Result<()> {
         Node::Terminal(0).into(),
         Node::Terminal(4).into(),
     ]);
-    let W = SequencingProgram::terminal(3);
+    let W = SequencingProgram::from_vec(vec![
+        Node::Internal(4).into(),
+        Node::Terminal(5).into(),
+        Node::Terminal(3).into(),
+    ]);
     let WIQ = RoutingProgram::terminal(1);
-    for (name, r, s) in [("C+C", &CR, &CS)] {
+    for (name, r, s) in [("C+W", &CR, &W)] {
         let mut simulation = Simulation::new(problem, r, s);
         let result = simulation.simulate_until(problem.depot.close / *NUM_TIME_SLOT, f32::MAX);
         log!(

@@ -2,7 +2,10 @@ use std::fmt::{self, Formatter};
 
 use smallvec::SmallVec;
 
-use crate::gp::program::{Program, ProgramContext, MAX_PROGRAM_NODE_CHILDREN};
+use crate::{
+    gp::program::{Program, ProgramContext, MAX_PROGRAM_NODE_CHILDREN},
+    log, DEBUG,
+};
 
 use super::{
     problem::{Problem, Request},
@@ -121,17 +124,25 @@ impl<'a> ProgramContext for RoutingContext<'a> {
                     / self.problem.depot.close
             }
             3 => {
-                self.vehicle_state
-                    .raw_time_cost(self.problem, self.request, self.time)
-                    / self.problem.depot.close
+                let rtc = self
+                    .vehicle_state
+                    .raw_time_cost(self.problem, self.request, self.time);
+                -rtc / self.problem.depot.close
             }
             4 => self.request.demand / self.problem.total_demand(),
+            5 => {
+                if self.vehicle_state.family.drone {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             _ => unreachable!(),
         }
     }
 
     fn num_terminals() -> usize {
-        5
+        6
     }
 }
 
@@ -162,6 +173,7 @@ impl<'a> ProgramContext for SequencingContext<'a> {
             .raw_time_cost(self.problem, self.request, self.time);
         let time_until_close = self.request.close - self.vehicle_state.busy_until;
         let wait_time = self.time - self.request.open;
+        log!(DEBUG, "fuck", t = raw_time_cost);
         match idx {
             0 => raw_time_cost / self.problem.depot.close,
             1 => (self.time - self.ready_time) / self.problem.depot.close,

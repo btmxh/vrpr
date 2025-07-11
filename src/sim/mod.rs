@@ -7,7 +7,7 @@ use std::{
 use ordered_float::{Float, OrderedFloat};
 use problem::VehicleFamily;
 
-use crate::{log, DEBUG, ROUTE, ROUTEEVAL, SIM};
+use crate::{log, DEBUG, K, ROUTE, ROUTEEVAL, SIM};
 
 use self::{
     ctx::{RoutingContext, RoutingProgram, SequencingContext, SequencingProgram},
@@ -196,14 +196,14 @@ impl<'a> RoutingRule for RoutingProgram<'a> {
                     Simulation::time_dist(&problem.depot, request, vehicles[*vehicle].family.speed);
                 cost_to_depot * 2.0 <= vehicles[*vehicle].family.charge_limit
             })
-            .filter(|vehicle| {
-                let cost = vehicles[*vehicle].raw_time_cost(problem, request, time);
-                time + cost <= request.close
-            })
+            // .filter(|vehicle| {
+            //     let cost = vehicles[*vehicle].raw_time_cost(problem, request, time);
+            //     time + cost <= request.close
+            // })
             .filter(|vehicle| !vehicles[*vehicle].dropped.contains(&request.idx))
             .filter(|vehicle| vehicles[*vehicle].family.capacity >= request.demand)
             .filter(|vehicle| !vehicles[*vehicle].family.drone || request.drone_serve);
-        k_smallest_by_key(suitable_vehicles, 5, |vehicle| {
+        k_smallest_by_key(suitable_vehicles, *K, |vehicle| {
             let value = self.calc(&RoutingContext {
                 problem,
                 time,
@@ -219,7 +219,7 @@ impl<'a> RoutingRule for RoutingProgram<'a> {
             );
             (
                 OrderedFloat(value),
-                // vehicles[*vehicle].queue.len(),
+                -(vehicles[*vehicle].queue.len() as isize),
             )
         })
     }
@@ -271,7 +271,6 @@ impl<'a> Simulation<'a> {
             .iter()
             .flat_map(|fam| (0..fam.count).map(|_| VehicleState::new(problem, fam)))
             .collect();
-        log!(DEBUG, "wtf", len = vehicles.len());
         Self {
             problem,
             routing_rule,
@@ -291,12 +290,6 @@ impl<'a> Simulation<'a> {
                 .entry(timeslot_idx)
                 .or_default()
                 .push(request);
-            log!(
-                DEBUG,
-                "timeslot",
-                time_slot = time_slot,
-                timeslot_idx = timeslot_idx
-            );
         }
 
         for (idx, requests) in batched_requests {
@@ -315,6 +308,8 @@ impl<'a> Simulation<'a> {
             log!(SIM, "sim_time", time = self.time);
             match event {
                 Event::Requests(requests, _) => {
+                    let ids: Vec<_> = requests.iter().map(|r| r.idx).collect();
+                    log!(SIM, "requests_arrive", ids = ids);
                     for request in requests {
                         self.handle_request(request, &mut total_failed);
                     }
@@ -347,6 +342,9 @@ impl<'a> Simulation<'a> {
             .map(|v| v.total_distance / v.family.speed)
             .max_by_key(|f| OrderedFloat(*f))
             .expect("should not be empty");
+
+        let has_depot = if self.resolved.contains(&0) { 1 } else { 0 };
+        total_failed += self.problem.requests.len() + has_depot - self.resolved.len();
         (makespan, total_failed)
     }
 
@@ -425,11 +423,17 @@ impl<'a> Simulation<'a> {
                 return;
             }
 
+            assert!(self.vehicles[vehicle].total_charge >= 0.0);
             let speed = self.vehicles[vehicle].family.speed;
-            if self.vehicles[vehicle].total_charge
-                < Self::time_dist(self.vehicles[vehicle].cur_request, request, speed)
-                    + Self::time_dist(request, &self.problem.depot, speed)
-            {
+            let necessary = Self::time_dist(self.vehicles[vehicle].cur_request, request, speed)
+                + Self::time_dist(request, &self.problem.depot, speed);
+            if self.vehicles[vehicle].total_charge < necessary {
+                log!(
+                    SIM,
+                    "return_to_charge",
+                    remaining = self.vehicles[vehicle].total_charge,
+                    necessary = necessary
+                );
                 // return to depot
                 self.route_vehicle_to(vehicle, &self.problem.depot);
                 return;
@@ -439,6 +443,14 @@ impl<'a> Simulation<'a> {
             let start_time =
                 self.time + self.vehicles[vehicle].time_cost(self.problem, request, self.time);
             if start_time > request.close {
+                log!(
+                    SIM,
+                    "dropped_request",
+                    request = request.idx,
+                    vehicle = vehicle,
+                    start_time = start_time,
+                    close = request.close
+                );
                 self.vehicles[vehicle].dropped.insert(request.idx);
                 self.handle_request(request, total_failed);
                 continue;
@@ -460,7 +472,8 @@ impl<'a> Simulation<'a> {
             state.total_charge = family.charge_limit;
         } else {
             state.total_demand -= request.demand;
-            state.total_charge -= distance;
+            state.total_charge -= distance / family.speed;
+            assert!(state.total_charge >= 0.0);
         }
         self.events.push(Reverse(Event::VehicleFinish {
             vehicle,
